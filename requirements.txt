@@ -1,0 +1,8 @@
+pyrogram
+tgcrypto
+python-dotenv
+vt-py
+PyPDF2
+google-generativeai
+python-docx
+openpyxl
