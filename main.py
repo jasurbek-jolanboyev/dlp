@@ -50,7 +50,8 @@ try:
     API_HASH = os.getenv("API_HASH")
     BOT_TOKEN = os.getenv("BOT_TOKEN")
     SUPER_ADMIN = int(os.getenv("SUPER_ADMIN_ID", "0"))
-    DATABASE_CHANNEL = int(os.getenv("DATABASE_CHANNEL", "0"))
+    DATABASE_CHANNEL = -1003725225836
+    # DATABASE_CHANNEL = int(os.getenv("DATABASE_CHANNEL", "0"))
     VT_API_KEY = os.getenv("VT_API_KEY")
     GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 except Exception as e:
@@ -392,17 +393,12 @@ async def monitor_handler(client, message: Message):
     user_info = f"{message.from_user.first_name} (@{message.from_user.username})" if message.from_user else "Noma'lum"
     user_mention = message.from_user.mention if message.from_user else "Foydalanuvchi"
 
-    # 1. Keshni tekshirish (Takroriy fayllarni skan qilmaslik uchun)
+    # 1. Keshni tekshirish
     file_id = None
     if message.document: file_id = message.document.file_unique_id
     elif message.photo: file_id = message.photo.file_unique_id
     
-    if file_id and file_id in SCAN_CACHE:
-        # Agar keshda "Toza" deb belgilangan bo'lsa, qayta tekshirmaymiz
-        if SCAN_CACHE[file_id] is None: return
-
-    # 2. Xavfli formatlarni aniqlash (Vaqtincha yashirish kerak bo'lganlar)
-    # Rasmlarni bu ro'yxatga qo'shmaymiz, chunki ular "joyida" tekshiriladi
+    # 2. Xavfli formatlarni aniqlash (Vaqtincha o'chiriladiganlar)
     hide_exts = ('.apk', '.exe', '.zip', '.rar', '.py', '.js')
     should_hide = (message.document and message.document.file_name and 
                    message.document.file_name.lower().endswith(hide_exts))
@@ -413,26 +409,21 @@ async def monitor_handler(client, message: Message):
 async def smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention):
     """Fayl turiga qarab aqlli tahlil oqimi"""
     threat = None
-    original_msg_id = message.id
     temp_msg = None
 
-    # Agar o'ta xavfli format bo'lsa, tahlil paytida guruhdan vaqtincha olib turamiz
+    # Tahlil paytida xavfli formatlarni yashirish
     if should_hide:
         try:
             temp_msg = await message.reply(f"⏳ {user_mention}, shubhali fayl tahlil qilinmoqda...")
+            # Xabarni o'chirishdan oldin tahlil uchun kerakli ma'lumotlarni saqlab qolamiz
+            async with heavy_file_limiter:
+                threat = await advanced_scan(message)
             await message.delete()
-        except: pass
-        
-        async with heavy_file_limiter:
-            threat = await advanced_scan(message)
+        except Exception as e:
+            logging.error(f"Xabarni o'chirishda xato: {e}")
     else:
-        # Rasmlar va matnlar uchun (Guruhda o'chirilmaydi)
         async with fast_scan_limiter:
             threat = await advanced_scan(message)
-
-    # Natijani keshga yozish
-    if file_id:
-        SCAN_CACHE[file_id] = threat
 
     # --- NATIJAGA QARAB HARAKAT ---
     if threat:
@@ -441,48 +432,56 @@ async def smart_scan_processor(client, message, should_hide, file_id, chat_id, c
                         (message.text or message.caption or "Fayl/Rasm"), 
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         
-        # 2. Foydalanuvchini ogohlantirish va xabarni butunlay o'chirish
+        # 2. Xavf topilsa
         if should_hide and temp_msg:
             await temp_msg.edit_text(f"🚨 {user_mention}, xavfli fayl aniqlandi: `{threat}`. Xabar bloklandi!")
             asyncio.create_task(delete_after_delay(temp_msg, 30))
         else:
             try:
-                # Rasmdagi yoki matndagi xavf topilganda endi o'chiramiz
                 warn = await message.reply(f"⚠️ {user_mention}, xabaringizda `{threat}` aniqlandi va o'chirildi!")
                 await message.delete()
                 asyncio.create_task(delete_after_delay(warn, 30))
-            except Exception as e:
-                logging.error(f"Xabarni o'chirishda xato: {e}")
+            except: pass
     else:
-        # 3. Xabar xavfsiz bo'lsa
+        # 3. Xavfsiz bo'lsa
         if should_hide and temp_msg:
-            await temp_msg.delete()
-            # Toza faylni guruhga qaytarish
-            await client.forward_messages(chat_id, chat_id, original_msg_id)
+            try:
+                await temp_msg.delete()
+                # Xabar o'chib ketgani uchun uni qayta yuboramiz (Forward emas, Copy)
+                await message.copy(chat_id)
+            except: pass
 
-    # --- KANALGA LOG QILISH (Toza bo'lsa ham hisobot boradi) ---
+    # --- KANALGA LOG QILISH ---
     await log_to_private_channel(client, message, threat, chat_id, chat_title, user_info)
 
 async def log_to_private_channel(client, message, threat, chat_id, chat_title, user_info):
-    """Kanalga barcha harakatlarni (toza/xavfli) nusxalash"""
-    if not DATABASE_CHANNEL or DATABASE_CHANNEL == 0: return
+    """Kanalga hisobot yuborish (Rasm/Fayl bo'lsa rasmi bilan, matn bo'lsa matni bilan)"""
+    if not DATABASE_CHANNEL or DATABASE_CHANNEL == 0: 
+        return
     
     try:
         status = "🚨 **TAHDID BLOKLANDI**" if threat else "✅ **XAVFSIZ (TEKSHIRILDI)**"
         log_report = (
             f"{status}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏢 **Guruh:** `{chat_title}`\n"
+            f"🏢 **Guruh:** `{chat_title}` (ID: `{chat_id}`)\n"
             f"👤 **User:** {user_info}\n"
             f"⚠️ **Xulosa:** `{threat if threat else 'Toza (Muammo yo`q)'}`\n"
             f"🕒 **Vaqt:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
 
-        # Xabarni kanalga nusxalash (rasmi/fayli bilan birga)
-        await message.copy(DATABASE_CHANNEL, caption=log_report)
+        # Rasm, hujjat yoki video bo'lsa - hisobot bilan birga nusxalash
+        if message.photo or message.document or message.video:
+            await message.copy(DATABASE_CHANNEL, caption=log_report)
+        else:
+            # Faqat matnli xabar bo'lsa
+            msg_text = message.text or message.caption or "[Ma'lumot yo'q]"
+            full_log = f"{log_report}\n\n📝 **Xabar matni:**\n`{msg_text}`"
+            await client.send_message(DATABASE_CHANNEL, full_log)
+            
     except Exception as e:
-        logging.error(f"Kanalga log yuborishda xato: {e}")
+        logging.error(f"❌ Kanalga log yuborishda xato: {e}")
 
 async def delete_after_delay(msg: Message, delay: int):
     await asyncio.sleep(delay)
