@@ -387,11 +387,11 @@ async def private_manager(client, message: Message):
     elif text == "⚙️ Admin Paneli" and user_id == SUPER_ADMIN:
         await message.reply("🛠 **Boshqaruv Paneli:**", reply_markup=get_admin_panel())
 
-# --- 6. MONITORING HANDLER (Aqlli Navbat va Dinamik Skanerlash) ---
+# --- 6. MONITORING HANDLER (Aqlli Navbat, Dinamik Skanerlash va Tarix) ---
 
 @app.on_message((filters.group | filters.channel) & ~filters.service, group=1)
 async def monitor_handler(client, message: Message):
-    # User faolligini fonda yangilash
+    # User faolligini yangilash
     if message.from_user:
         asyncio.create_task(asyncio.to_thread(db.update_last_seen, message.from_user.id))
 
@@ -399,7 +399,9 @@ async def monitor_handler(client, message: Message):
     chat_title = message.chat.title or "Guruh/Kanal"
     db.add_group(chat_id, chat_title)
     
-    user_info = f"{message.from_user.first_name} (@{message.from_user.username})" if message.from_user else "Noma'lum"
+    # Foydalanuvchi ma'lumotlari
+    user_id = message.from_user.id if message.from_user else 0
+    user_info = f"{message.from_user.first_name} (@{message.from_user.username}) [ID:{user_id}]" if message.from_user else "Noma'lum"
     user_mention = message.from_user.mention if message.from_user else "Foydalanuvchi"
 
     # 1. Fayl identifikatorini olish
@@ -407,113 +409,150 @@ async def monitor_handler(client, message: Message):
     if message.document: file_id = message.document.file_unique_id
     elif message.photo: file_id = message.photo.file_unique_id
     
-    # --- KESHNI TEKSHIRISH (YANGI BLOK) ---
+    # --- KESHNI TEKSHIRISH ---
     if file_id and file_id in SCAN_CACHE:
         cached_threat = SCAN_CACHE[file_id]
+        # Agar keshda xavf bo'lsa, tahlilni kutmasdan darhol processorga yuboramiz
         if cached_threat:
-            # Agar keshda xavf aniqlangan bo'lsa, tahlil qilmasdan darhol processorga yuboramiz
-            logging.info(f"⚡ Keshdan topildi (Xavfli): {cached_threat}")
             asyncio.create_task(smart_scan_processor(client, message, False, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=cached_threat))
             return
-        else:
-            # Agar keshda "Toza" (None) bo'lsa, bot indamay o'tib ketadi
-            logging.info("✅ Keshdan topildi (Toza). Skanerlash o'tkazib yuborildi.")
-            return
-    # --------------------------------------
+        # Toza fayllar uchun keshdan o'tish (ixtiyoriy, agar qayta yuborish kerak bo'lsa buni o'chirib qo'ying)
 
-    # 2. Xavfli formatlarni aniqlash
-    hide_exts = ('.apk', '.exe', '.zip', '.rar', '.py', '.js')
-    should_hide = (message.document and message.document.file_name and 
-                   message.document.file_name.lower().endswith(hide_exts))
+    # 2. Xavfli/Tahlil qilinadigan formatlar (Sinchkovlik bilan)
+    dangerous_exts = ('.apk', '.exe', '.doc', '.docx', '.xlsx', '.xls', '.pdf', '.zip', '.rar', '.py', '.js', '.bat', '.msi')
+    should_hide = False
+    
+    if message.document and message.document.file_name:
+        if message.document.file_name.lower().endswith(dangerous_exts):
+            should_hide = True
+    elif message.photo: # Rasmlar ham passport/karta uchun yashirib tekshiriladi
+        should_hide = True
 
     # Skanerlashni fonda ishga tushirish
     asyncio.create_task(smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention))
 
 async def smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=None):
-    """Fayl turiga qarab aqlli tahlil oqimi"""
-    threat = manual_threat # Keshdan kelgan bo'lsa foydalanamiz
+    """
+    Fayl turiga qarab aqlli tahlil oqimi:
+    1. Kiber-tahlil (VirusTotal + Gemini AI)
+    2. Xavfli bo'lsa bloklash va bazaga tarixiy qayd qilish
+    3. Toza bo'lsa xabarni qaytarish va foydalanuvchini ogohlantirish
+    4. Kanalga batafsil log yuborish
+    """
+    threat = manual_threat  # Keshdan kelgan tayyor natija bo'lsa foydalanamiz
     temp_msg = None
+    user_id = message.from_user.id if message.from_user else 0
 
-    # Agar keshda yo'q bo'lsa, yangidan skanerlaymiz
+    # --- 1. TAHLIL BOSQICHI ---
     if threat is None:
         if should_hide:
             try:
-                temp_msg = await message.reply(f"⏳ {user_mention}, shubhali fayl tahlil qilinmoqda...")
+                # Xavfli format (.apk, .exe va h.k.) bo'lsa, tahlil paytida xabarni yashiramiz
+                temp_msg = await message.reply(f"⏳ {user_mention}, faylingiz kiber-tahlildan o'tkazilmoqda...")
+                await message.delete() 
+                
                 async with heavy_file_limiter:
                     threat = await advanced_scan(message)
-                await message.delete()
-            except: pass
+            except Exception as e:
+                logging.error(f"Skanerlashda xatolik: {e}")
         else:
+            # Oddiy matn yoki rasmlar uchun tezkor skaner
             async with fast_scan_limiter:
                 threat = await advanced_scan(message)
         
-        # Yangi natijani keshga saqlaymiz
+        # Skanerlash natijasini keshga saqlash (qayta skanerlamaslik uchun)
         if file_id:
             SCAN_CACHE[file_id] = threat
 
-    # --- NATIJAGA QARAB HARAKAT ---
+    # --- 2. NATIJAGA QARAB HARAKAT ---
     if threat:
-        db.add_incident(chat_id, chat_title, user_info, threat, 
-                        (message.text or message.caption or "Fayl/Rasm"), 
-                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        # A) AGAR TAHID ANIQLANSA:
+        # Bazaga incident sifatida yozamiz (Tarix shakllanishi uchun)
+        db.add_incident(
+            chat_id, chat_title, user_info, threat, 
+            (message.text or message.caption or "Fayl/Rasm"), 
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        )
         
-        if should_hide and temp_msg:
-            await temp_msg.edit_text(f"🚨 {user_mention}, xavfli fayl aniqlandi: `{threat}`. Xabar bloklandi!")
+        warn_text = f"🚨 {user_mention}, xavfli ma'lumot aniqlandi: `{threat}`. Xabaringiz bloklandi!"
+        
+        if temp_msg:
+            # Agar oldin "tahlil qilinmoqda" degan bo'lsak, shuni tahrirlaymiz
+            await temp_msg.edit_text(warn_text)
             asyncio.create_task(delete_after_delay(temp_msg, 30))
         else:
+            # Agar xabar o'chirilmagan bo'lsa (should_hide=False), endi o'chiramiz va ogohlantiramiz
             try:
-                # Agar keshdan kelgan bo'lsa va temp_msg bo'lmasa, reply o'rniga yangi xabar
-                warn_text = f"⚠️ {user_mention}, xabaringizda `{threat}` aniqlandi va o'chirildi!"
-                if temp_msg: await temp_msg.edit_text(warn_text)
-                else: 
-                    warn = await message.reply(warn_text)
-                    asyncio.create_task(delete_after_delay(warn, 30))
+                warn = await message.reply(warn_text)
                 await message.delete()
+                asyncio.create_task(delete_after_delay(warn, 30))
             except: pass
     else:
-        if should_hide and temp_msg:
+        # B) AGAR XABAR TOZA BO'LSA:
+        if should_hide:
             try:
-                await temp_msg.delete()
+                # "Tahlil qilinmoqda" xabarini o'chiramiz
+                if temp_msg: await temp_msg.delete()
+                
+                # Foydalanuvchiga tasdiq xabarini yuboramiz
+                confirm_msg = await client.send_message(
+                    chat_id, 
+                    f"✅ {user_mention}, faylingiz muvaffaqiyatli tekshirildi. Kiber-tahdid aniqlanmadi."
+                )
+                
+                # Asl faylni guruhga qaytarib yuboramiz (Copy orqali)
                 await message.copy(chat_id)
-            except: pass
+                
+                # Tasdiq xabarini 10 soniyadan keyin o'chiramiz
+                asyncio.create_task(delete_after_delay(confirm_msg, 10))
+            except Exception as e:
+                logging.error(f"Faylni qaytarishda xato: {e}")
 
-    # --- KANALGA LOG QILISH ---
-    await log_to_private_channel(client, message, threat, chat_id, chat_title, user_info)
-
-async def log_to_private_channel(client, message, threat, chat_id, chat_title, user_info):
-    """Kanalga hisobot yuborish (Rasm/Fayl bo'lsa rasmi bilan, matn bo'lsa matni bilan)"""
-    if not DATABASE_CHANNEL or DATABASE_CHANNEL == 0: 
-        return
+    # --- 3. KANALGA LOG QILISH ---
+    # Tarixiy ma'lumotlar bilan birga kanalga hisobot yuborish
+    await log_to_private_channel(client, message, threat, chat_id, chat_title, user_info, user_id)
+    
+async def log_to_private_channel(client, message, threat, chat_id, chat_title, user_info, user_id):
+    """Kanalga tarixiy ma'lumotlar bilan hisobot yuborish"""
+    if not DATABASE_CHANNEL: return
     
     try:
-        status = "🚨 **TAHDID BLOKLANDI**" if threat else "✅ **XAVFSIZ (TEKSHIRILDI)**"
+        # Foydalanuvchi tarixini olish
+        incident_count = db.get_user_history(user_id)
+        
+        status = "🚨 **TAHDID ANIQLANDI VA BLOKLANDI**" if threat else "✅ **XAVFSIZ (TEKSHIRUVDAN O'TDI)**"
+        color = "🔴" if threat else "🟢"
+        
         log_report = (
-            f"{status}\n"
+            f"{color} {status}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏢 **Guruh:** `{chat_title}` (ID: `{chat_id}`)\n"
-            f"👤 **User:** {user_info}\n"
-            f"⚠️ **Xulosa:** `{threat if threat else 'Toza (Muammo yo`q)'}`\n"
+            f"🏢 **Guruh:** `{chat_title}`\n"
+            f"👤 **Foydalanuvchi:** {user_info}\n"
+            f"🆔 **User ID:** `{user_id}`\n"
+            f"⚠️ **Xavf turi:** `{threat if threat else 'Toza / Xavfsiz'}`\n"
+            f"📊 **Qilmishlar tarixi:** `{incident_count}-marta`\n"
             f"🕒 **Vaqt:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
 
-        # Rasm, hujjat yoki video bo'lsa - hisobot bilan birga nusxalash
+        # Fayl yoki rasm bo'lsa kopyasini yuboramiz
         if message.photo or message.document or message.video:
             await message.copy(DATABASE_CHANNEL, caption=log_report)
         else:
-            # Faqat matnli xabar bo'lsa
-            msg_text = message.text or message.caption or "[Ma'lumot yo'q]"
-            full_log = f"{log_report}\n\n📝 **Xabar matni:**\n`{msg_text}`"
+            msg_text = message.text or message.caption or "[Matn mavjud emas]"
+            full_log = f"{log_report}\n\n📝 **Asl xabar matni:**\n`{msg_text}`"
             await client.send_message(DATABASE_CHANNEL, full_log)
             
     except Exception as e:
         logging.error(f"❌ Kanalga log yuborishda xato: {e}")
 
 async def delete_after_delay(msg: Message, delay: int):
+    """Xabarlarni ma'lum vaqtdan keyin o'chirish"""
     await asyncio.sleep(delay)
     try:
         await msg.delete()
     except: pass
+
 # --- 7. CALLBACK HANDLER (To'liq va To'g'rilangan Versiya) ---
 @app.on_callback_query()
 async def admin_callback_handler(client, cb: CallbackQuery):
