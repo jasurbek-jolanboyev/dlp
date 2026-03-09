@@ -79,12 +79,14 @@ async def check_malicious_ai(text: str):
         return False
     try:
         prompt = (
-            "Analyze the following text for sensitive information. "
-            "If it contains Passport numbers, JSHSHIR (Personal ID), Credit Card details, "
-            "or Phishing/Malicious links, reply ONLY with 'DANGER'. "
-            "Otherwise, reply 'SAFE'.\n\n"
-            f"Content: {text[:1500]}"
-        )
+                "Siz kiberxavfsizlik mutaxassisiz. Ushbu rasmda quyidagilarni qidiring: "
+                "1. O'zbekiston yoki boshqa davlat passporti (Seriya va raqam). "
+                "2. Bank kartasi (16 talik raqam). "
+                "3. JSHSHIR (14 talik raqam). "
+                "4. Shaxsiy guvohnomalar. "
+                "Agar birortasini topsangiz, faqat topilgan narsa nomini yozing (masalan: 'Passport'). "
+                "Agar rasmda faqat manzara, chat yoki xavfsiz narsa bo'lsa, faqat 'SAFE' deb javob bering."
+            )
         # Gemini javobini executor'da kutamiz (blocking bo'lmasligi uchun)
         response = await asyncio.to_thread(ai_model.generate_content, prompt)
         return "DANGER" in response.text.upper()
@@ -127,8 +129,8 @@ async def vt_scan_file(file_path: str):
         async with vt.Client(VT_API_KEY) as client:
             with open(file_path, "rb") as f:
                 analysis = await client.scan_file_async(f)
-                # Tahlil tugashini kutish (max 30 sek)
-                for _ in range(6):
+               
+                for _ in range(12): # 12 marta 5 sekunddan = 60 sek
                     result = await client.get_object_async(f"/analyses/{analysis.id}")
                     if result.status == "completed":
                         return result.stats.get('malicious', 0) > 0
@@ -158,32 +160,68 @@ def extract_text_from_file(file_path: str):
         logging.error(f"File Extraction Error ({ext}): {e}")
     return text
 
+# --- 3. SCANNER FUNKSIYALARI (YANGILANGAN) ---
+
 async def advanced_scan(message: Message):
     """Barcha turdagi xabarlar uchun universal skaner"""
-    # 1. Matn va Caption (Izoh) tahlili
+    
+    # 1. Matn va Caption tahlili
     content = f"{message.text or ''} {message.caption or ''}".strip()
     if content:
-        # Regex bilan tezkor tekshirish
+        # Regex (Tezkor)
         clean_text = content.replace(" ", "").replace("-", "")
         for label, pattern in PATTERNS.items():
             if re.search(pattern, content, re.IGNORECASE) or re.search(pattern, clean_text):
                 return label
         
-        # Gemini AI bilan matn tahlili
+        # Gemini AI (Chuqur)
         if await check_malicious_ai(content):
             return "⚠️ Shubhali mazmun (AI)"
 
-    # 2. Fayl (Hujjat) tahlili
+    # 2. Rasm tahlili (Passportni kormayotgan qism shu yerda)
+    if message.photo:
+        img_path = await message.download()
+        threat = None
+        
+        # A) EasyOCR
+        if OCR_AVAILABLE:
+            try:
+                loop = asyncio.get_event_loop()
+                # Rasmni yaxshilash (agar PIL ishlatilsa)
+                results = await loop.run_in_executor(None, reader.readtext, img_path)
+                detected_text = " ".join([res[1] for res in results]).upper().replace(" ", "")
+                
+                # Passport seriyasini tekshirishni kuchaytiramiz
+                for label, pattern in PATTERNS.items():
+                    if re.search(pattern, detected_text):
+                        threat = f"{label} (OCR)"
+                        break
+            except Exception as e:
+                logging.error(f"OCR Error: {e}")
+
+        # B) Gemini Vision (Promptni aniqlashtiramiz)
+        if not threat:
+            threat_ai = await check_image_ai(img_path)
+            if threat_ai:
+                threat = f"{threat_ai} (AI Vision)"
+
+        if os.path.exists(img_path): os.remove(img_path)
+        return threat
+
+    # 3. Fayl tahlili (APK va boshqalar)
     if message.document:
-        if message.document.file_size <= 25 * 1024 * 1024:
+        # Katta fayllarni ham tekshirish uchun limitni 50MB ga chiqaramiz
+        if message.document.file_size <= 50 * 1024 * 1024:
             path = await message.download()
             
-            # VirusTotal faqat hujjatlar/programmalar uchun
-            if await vt_scan_file(path):
+            # VirusTotal (APKlar uchun eng muhimi)
+            # Tahlil vaqtini 60 sekundga chiqaramiz
+            is_virus = await vt_scan_file(path) 
+            if is_virus:
                 if os.path.exists(path): os.remove(path)
-                return "🦠 Virus (Malware)"
+                return "🦠 Virus/Zararli dastur (Malware)"
             
-            # Fayl ichidagi matnni tekshirish
+            # Hujjat ichidagi matn
             file_text = extract_text_from_file(path)
             if os.path.exists(path): os.remove(path)
             
@@ -191,37 +229,8 @@ async def advanced_scan(message: Message):
                 clean_file_text = file_text.replace(" ", "").replace("-", "")
                 for label, pattern in PATTERNS.items():
                     if re.search(pattern, clean_file_text, re.IGNORECASE):
-                        return f"{label} (Fayl ichida)"
-
-    # 3. Rasm tahlili (YANGILANGAN QISM)
-    if message.photo:
-        img_path = await message.download()
-        threat = None
-        
-        # A) EasyOCR orqali matnni qidirish
-        if OCR_AVAILABLE:
-            try:
-                loop = asyncio.get_event_loop()
-                results = await loop.run_in_executor(None, reader.readtext, img_path)
-                detected_text = " ".join([res[1] for res in results]).replace(" ", "")
-                for label, pattern in PATTERNS.items():
-                    if re.search(pattern, detected_text, re.IGNORECASE):
-                        threat = f"{label} (OCR)"
-            except Exception as e:
-                logging.error(f"OCR tahlilida xato: {e}")
-
-        # B) Agar OCR topmasa, Gemini Vision orqali chuqur tahlil
-        if not threat:
-            threat_ai = await check_image_ai(img_path)
-            if threat_ai:
-                threat = f"{threat_ai} (AI Vision)"
-
-        # Faylni o'chirish
-        if os.path.exists(img_path):
-            os.remove(img_path)
-            
-        return threat
-
+                        return f"{label} (Hujjat ichida)"
+                        
     return None
 
 # --- 4. INTERFEYS VA TUGMALAR ---
@@ -393,12 +402,26 @@ async def monitor_handler(client, message: Message):
     user_info = f"{message.from_user.first_name} (@{message.from_user.username})" if message.from_user else "Noma'lum"
     user_mention = message.from_user.mention if message.from_user else "Foydalanuvchi"
 
-    # 1. Keshni tekshirish
+    # 1. Fayl identifikatorini olish
     file_id = None
     if message.document: file_id = message.document.file_unique_id
     elif message.photo: file_id = message.photo.file_unique_id
     
-    # 2. Xavfli formatlarni aniqlash (Vaqtincha o'chiriladiganlar)
+    # --- KESHNI TEKSHIRISH (YANGI BLOK) ---
+    if file_id and file_id in SCAN_CACHE:
+        cached_threat = SCAN_CACHE[file_id]
+        if cached_threat:
+            # Agar keshda xavf aniqlangan bo'lsa, tahlil qilmasdan darhol processorga yuboramiz
+            logging.info(f"⚡ Keshdan topildi (Xavfli): {cached_threat}")
+            asyncio.create_task(smart_scan_processor(client, message, False, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=cached_threat))
+            return
+        else:
+            # Agar keshda "Toza" (None) bo'lsa, bot indamay o'tib ketadi
+            logging.info("✅ Keshdan topildi (Toza). Skanerlash o'tkazib yuborildi.")
+            return
+    # --------------------------------------
+
+    # 2. Xavfli formatlarni aniqlash
     hide_exts = ('.apk', '.exe', '.zip', '.rar', '.py', '.js')
     should_hide = (message.document and message.document.file_name and 
                    message.document.file_name.lower().endswith(hide_exts))
@@ -406,48 +429,51 @@ async def monitor_handler(client, message: Message):
     # Skanerlashni fonda ishga tushirish
     asyncio.create_task(smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention))
 
-async def smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention):
+async def smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=None):
     """Fayl turiga qarab aqlli tahlil oqimi"""
-    threat = None
+    threat = manual_threat # Keshdan kelgan bo'lsa foydalanamiz
     temp_msg = None
 
-    # Tahlil paytida xavfli formatlarni yashirish
-    if should_hide:
-        try:
-            temp_msg = await message.reply(f"⏳ {user_mention}, shubhali fayl tahlil qilinmoqda...")
-            # Xabarni o'chirishdan oldin tahlil uchun kerakli ma'lumotlarni saqlab qolamiz
-            async with heavy_file_limiter:
+    # Agar keshda yo'q bo'lsa, yangidan skanerlaymiz
+    if threat is None:
+        if should_hide:
+            try:
+                temp_msg = await message.reply(f"⏳ {user_mention}, shubhali fayl tahlil qilinmoqda...")
+                async with heavy_file_limiter:
+                    threat = await advanced_scan(message)
+                await message.delete()
+            except: pass
+        else:
+            async with fast_scan_limiter:
                 threat = await advanced_scan(message)
-            await message.delete()
-        except Exception as e:
-            logging.error(f"Xabarni o'chirishda xato: {e}")
-    else:
-        async with fast_scan_limiter:
-            threat = await advanced_scan(message)
+        
+        # Yangi natijani keshga saqlaymiz
+        if file_id:
+            SCAN_CACHE[file_id] = threat
 
     # --- NATIJAGA QARAB HARAKAT ---
     if threat:
-        # 1. Bazaga yozish
         db.add_incident(chat_id, chat_title, user_info, threat, 
                         (message.text or message.caption or "Fayl/Rasm"), 
                         datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         
-        # 2. Xavf topilsa
         if should_hide and temp_msg:
             await temp_msg.edit_text(f"🚨 {user_mention}, xavfli fayl aniqlandi: `{threat}`. Xabar bloklandi!")
             asyncio.create_task(delete_after_delay(temp_msg, 30))
         else:
             try:
-                warn = await message.reply(f"⚠️ {user_mention}, xabaringizda `{threat}` aniqlandi va o'chirildi!")
+                # Agar keshdan kelgan bo'lsa va temp_msg bo'lmasa, reply o'rniga yangi xabar
+                warn_text = f"⚠️ {user_mention}, xabaringizda `{threat}` aniqlandi va o'chirildi!"
+                if temp_msg: await temp_msg.edit_text(warn_text)
+                else: 
+                    warn = await message.reply(warn_text)
+                    asyncio.create_task(delete_after_delay(warn, 30))
                 await message.delete()
-                asyncio.create_task(delete_after_delay(warn, 30))
             except: pass
     else:
-        # 3. Xavfsiz bo'lsa
         if should_hide and temp_msg:
             try:
                 await temp_msg.delete()
-                # Xabar o'chib ketgani uchun uni qayta yuboramiz (Forward emas, Copy)
                 await message.copy(chat_id)
             except: pass
 
