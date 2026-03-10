@@ -99,19 +99,21 @@ async def check_image_ai(file_path: str):
     if not GEMINI_API_KEY: 
         return None
     try:
-        # Rasmni Gemini serveriga vaqtincha yuklash
-        img_file = await asyncio.to_thread(genai.upload_file, path=file_path)
+        # Faylni Gemini serveriga yuklash (path= o'chirildi)
+        img_file = await asyncio.to_thread(genai.upload_file, file_path)
         
         prompt = (
-            "Ushbu rasmda bank kartasi raqamlari, passport ma'lumotlari, JSHSHIR raqami "
-            "yoki shaxsiy hujjatlar bormi? Agar bo'lsa, xavf turini qisqa ayting (masalan: 'Passport'). "
-            "Agar xavfsiz bo'lsa, faqat 'SAFE' deb javob bering."
+            "Ushbu rasmda quyidagilarni aniqlang: Passport, ID karta, "
+            "bank kartasi raqamlari, JSHSHIR yoki talabalik guvohnomasi. "
+            "Agar xavf topilsa, nomini ayting (masalan: 'Passport'). "
+            "Agar mutlaqo xavfsiz bo'lsa, faqat 'SAFE' deb javob bering."
         )
         
-        response = await asyncio.to_thread(ai_model.generate_content, [prompt, img_file])
+        # Muhim: [img_file, prompt] tartibida yuboriladi
+        response = await asyncio.to_thread(ai_model.generate_content, [img_file, prompt])
         
-        # Faylni Gemini serveridan darhol o'chirish
-        await asyncio.to_thread(img_file.delete)
+        # Faylni Gemini serveridan o'chirish
+        await asyncio.to_thread(genai.delete_file, img_file.name)
         
         res_text = response.text.strip().upper()
         if "SAFE" in res_text:
@@ -122,19 +124,20 @@ async def check_image_ai(file_path: str):
         return None
 
 async def vt_scan_file(file_path: str):
-    """Faylni VirusTotal API orqali virusga tekshirish"""
-    if not VT_API_KEY: 
-        return False
+    if not VT_API_KEY: return False
     try:
         async with vt.Client(VT_API_KEY) as client:
             with open(file_path, "rb") as f:
+                # Faylni yuklash
                 analysis = await client.scan_file_async(f)
-               
-                for _ in range(12): # 12 marta 5 sekunddan = 60 sek
+                
+                # Kutish jarayoni (Deadline exceeded oldini olish uchun)
+                for _ in range(15): # 75 soniyagacha kutadi
+                    await asyncio.sleep(5)
+                    # Analiz holatini yangilangan usulda tekshiramiz
                     result = await client.get_object_async(f"/analyses/{analysis.id}")
                     if result.status == "completed":
                         return result.stats.get('malicious', 0) > 0
-                    await asyncio.sleep(5)
     except Exception as e:
         logging.error(f"VirusTotal Scan Error: {e}")
     return False
@@ -163,50 +166,68 @@ def extract_text_from_file(file_path: str):
 # --- 3. SCANNER FUNKSIYALARI (YANGILANGAN) ---
 
 async def advanced_scan(message: Message):
-    """Barcha turdagi xabarlar uchun universal skaner"""
-    
-    # 1. Matn va Caption tahlili
+    """Skanerlashda xavfsizlikni kuchaytirilgan varianti"""
+    file_id = "none"
+    if message.document: file_id = message.document.file_unique_id
+    elif message.photo: file_id = message.photo.file_unique_id
+
+    # 1. Matn va Caption tahlili (Regex + Gemini)
     content = f"{message.text or ''} {message.caption or ''}".strip()
     if content:
-        # Regex (Tezkor)
         clean_text = content.replace(" ", "").replace("-", "")
         for label, pattern in PATTERNS.items():
             if re.search(pattern, content, re.IGNORECASE) or re.search(pattern, clean_text):
                 return label
-        
-        # Gemini AI (Chuqur)
         if await check_malicious_ai(content):
             return "⚠️ Shubhali mazmun (AI)"
 
-    # 2. Rasm tahlili (Passportni kormayotgan qism shu yerda)
-    if message.photo:
-        img_path = await message.download()
-        threat = None
-        
-        # A) EasyOCR
-        if OCR_AVAILABLE:
+    # 2. Hujjat va Fayl tahlili (VirusTotal - ENG MUHIMI)
+    if message.document:
+        if message.document.file_size <= 50 * 1024 * 1024: # 50MB limit
+            file_name = message.document.file_name or "temp_file"
+            path = await message.download(file_name=f"downloads/{file_id}_{file_name}")
+            
             try:
-                loop = asyncio.get_event_loop()
-                # Rasmni yaxshilash (agar PIL ishlatilsa)
-                results = await loop.run_in_executor(None, reader.readtext, img_path)
-                detected_text = " ".join([res[1] for res in results]).upper().replace(" ", "")
+                # VirusTotal tekshiruvi
+                is_virus = await vt_scan_file(path) 
+                if is_virus:
+                    return "🦠 Virus/Zararli dastur (Malware)"
                 
-                # Passport seriyasini tekshirishni kuchaytiramiz
+                # Hujjat ichidagi matnni tekshirish (DLP uchun)
+                file_text = extract_text_from_file(path)
+                if file_text:
+                    clean_file_text = file_text.replace(" ", "").replace("-", "")
+                    for label, pattern in PATTERNS.items():
+                        if re.search(pattern, clean_file_text, re.IGNORECASE):
+                            return f"{label} (Hujjat ichida)"
+            except Exception as e:
+                logging.error(f"Fayl skanerlashda xato: {e}")
+            finally:
+                if os.path.exists(path): os.remove(path)
+
+    # 3. Rasm tahlili (OCR + AI Vision)
+    if message.photo:
+        img_path = await message.download(file_name=f"downloads/{file_id}.jpg")
+        try:
+            threat = None
+            if OCR_AVAILABLE:
+                results = await asyncio.to_thread(reader.readtext, img_path)
+                detected_text = " ".join([res[1] for res in results]).upper().replace(" ", "")
                 for label, pattern in PATTERNS.items():
                     if re.search(pattern, detected_text):
                         threat = f"{label} (OCR)"
                         break
-            except Exception as e:
-                logging.error(f"OCR Error: {e}")
 
-        # B) Gemini Vision (Promptni aniqlashtiramiz)
-        if not threat:
-            threat_ai = await check_image_ai(img_path)
-            if threat_ai:
-                threat = f"{threat_ai} (AI Vision)"
-
-        if os.path.exists(img_path): os.remove(img_path)
-        return threat
+            if not threat:
+                threat_ai = await check_image_ai(img_path)
+                if threat_ai: 
+                    threat = f"{threat_ai} (AI Vision)"
+            
+            return threat
+        finally:
+            if os.path.exists(img_path): os.remove(img_path)
+                        
+    return None
 
     # 3. Fayl tahlili (APK va boshqalar)
     if message.document:
@@ -387,11 +408,13 @@ async def private_manager(client, message: Message):
     elif text == "⚙️ Admin Paneli" and user_id == SUPER_ADMIN:
         await message.reply("🛠 **Boshqaruv Paneli:**", reply_markup=get_admin_panel())
 
-# --- 6. MONITORING HANDLER (Aqlli Navbat, Dinamik Skanerlash va Tarix) ---
+# --- 6. MONITORING HANDLER (To'liq Yangilangan va To'g'rilangan Versiya) ---
 
 @app.on_message((filters.group | filters.channel) & ~filters.service, group=1)
 async def monitor_handler(client, message: Message):
-    # User faolligini yangilash
+    """Barcha xabarlarni tutib qolish va tahlilga yo'naltirish"""
+    
+    # 1. Foydalanuvchi faolligini yangilash
     if message.from_user:
         asyncio.create_task(asyncio.to_thread(db.update_last_seen, message.from_user.id))
 
@@ -399,128 +422,96 @@ async def monitor_handler(client, message: Message):
     chat_title = message.chat.title or "Guruh/Kanal"
     db.add_group(chat_id, chat_title)
     
-    # Foydalanuvchi ma'lumotlari
     user_id = message.from_user.id if message.from_user else 0
     user_info = f"{message.from_user.first_name} (@{message.from_user.username}) [ID:{user_id}]" if message.from_user else "Noma'lum"
     user_mention = message.from_user.mention if message.from_user else "Foydalanuvchi"
 
-    # 1. Fayl identifikatorini olish
+    # 2. Keshni tekshirish
     file_id = None
     if message.document: file_id = message.document.file_unique_id
     elif message.photo: file_id = message.photo.file_unique_id
     
-    # --- KESHNI TEKSHIRISH ---
     if file_id and file_id in SCAN_CACHE:
-        cached_threat = SCAN_CACHE[file_id]
-        # Agar keshda xavf bo'lsa, tahlilni kutmasdan darhol processorga yuboramiz
-        if cached_threat:
-            asyncio.create_task(smart_scan_processor(client, message, False, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=cached_threat))
-            return
-        # Toza fayllar uchun keshdan o'tish (ixtiyoriy, agar qayta yuborish kerak bo'lsa buni o'chirib qo'ying)
+        threat = SCAN_CACHE[file_id]
+        asyncio.create_task(smart_scan_processor(client, message, False, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=threat))
+        return
 
-    # 2. Xavfli/Tahlil qilinadigan formatlar (Sinchkovlik bilan)
-    dangerous_exts = ('.apk', '.exe', '.doc', '.docx', '.xlsx', '.xls', '.pdf', '.zip', '.rar', '.py', '.js', '.bat', '.msi')
+    # 3. Fayl turiga qarab yashirish mantiqi
+    dangerous_exts = ('.apk', '.exe', '.bat', '.msi', '.py', '.js', '.scr', '.vbs', '.doc', '.docx', '.pdf', '.zip', '.rar')
     should_hide = False
-    
     if message.document and message.document.file_name:
         if message.document.file_name.lower().endswith(dangerous_exts):
             should_hide = True
-    elif message.photo: # Rasmlar ham passport/karta uchun yashirib tekshiriladi
-        should_hide = True
 
     # Skanerlashni fonda ishga tushirish
     asyncio.create_task(smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention))
 
 async def smart_scan_processor(client, message, should_hide, file_id, chat_id, chat_title, user_info, user_mention, manual_threat=None):
-    """
-    Fayl turiga qarab aqlli tahlil oqimi:
-    1. Kiber-tahlil (VirusTotal + Gemini AI)
-    2. Xavfli bo'lsa bloklash va bazaga tarixiy qayd qilish
-    3. Toza bo'lsa xabarni qaytarish va foydalanuvchini ogohlantirish
-    4. Kanalga batafsil log yuborish
-    """
-    threat = manual_threat  # Keshdan kelgan tayyor natija bo'lsa foydalanamiz
+    """Xabarni tahlil qilish, jazolash va log kanalga yuborish"""
+    threat = manual_threat 
     temp_msg = None
     user_id = message.from_user.id if message.from_user else 0
 
     # --- 1. TAHLIL BOSQICHI ---
     if threat is None:
-        if should_hide:
-            try:
-                # Xavfli format (.apk, .exe va h.k.) bo'lsa, tahlil paytida xabarni yashiramiz
-                temp_msg = await message.reply(f"⏳ {user_mention}, faylingiz kiber-tahlildan o'tkazilmoqda...")
+        try:
+            if should_hide:
+                temp_msg = await message.reply(f"⏳ {user_mention}, kiber-tahlil ketmoqda...")
                 await message.delete() 
-                
                 async with heavy_file_limiter:
                     threat = await advanced_scan(message)
-            except Exception as e:
-                logging.error(f"Skanerlashda xatolik: {e}")
-        else:
-            # Oddiy matn yoki rasmlar uchun tezkor skaner
-            async with fast_scan_limiter:
-                threat = await advanced_scan(message)
-        
-        # Skanerlash natijasini keshga saqlash (qayta skanerlamaslik uchun)
-        if file_id:
-            SCAN_CACHE[file_id] = threat
+            else:
+                async with fast_scan_limiter:
+                    threat = await advanced_scan(message)
+            
+            if file_id: SCAN_CACHE[file_id] = threat
+        except Exception as e:
+            logging.error(f"Skanerlash xatosi: {e}")
 
-    # --- 2. NATIJAGA QARAB HARAKAT ---
+    # --- 2. JAZO VA OGOHLANTIRISH ---
     if threat:
-        # A) AGAR TAHID ANIQLANSA:
-        # Bazaga incident sifatida yozamiz (Tarix shakllanishi uchun)
-        db.add_incident(
-            chat_id, chat_title, user_info, threat, 
-            (message.text or message.caption or "Fayl/Rasm"), 
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
+        db.add_incident(chat_id, chat_title, user_info, threat, 
+                        (message.text or message.caption or "Fayl/Rasm"), 
+                        datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         
-        warn_text = f"🚨 {user_mention}, xavfli ma'lumot aniqlandi: `{threat}`. Xabaringiz bloklandi!"
+        warn_text = f"🚨 {user_mention}, xavfli ma'lumot aniqlandi: `{threat}`. Bloklandi!"
         
         if temp_msg:
-            # Agar oldin "tahlil qilinmoqda" degan bo'lsak, shuni tahrirlaymiz
             await temp_msg.edit_text(warn_text)
             asyncio.create_task(delete_after_delay(temp_msg, 30))
         else:
-            # Agar xabar o'chirilmagan bo'lsa (should_hide=False), endi o'chiramiz va ogohlantiramiz
             try:
                 warn = await message.reply(warn_text)
                 await message.delete()
                 asyncio.create_task(delete_after_delay(warn, 30))
             except: pass
     else:
-        # B) AGAR XABAR TOZA BO'LSA:
-        if should_hide:
+        if should_hide and temp_msg:
             try:
-                # "Tahlil qilinmoqda" xabarini o'chiramiz
-                if temp_msg: await temp_msg.delete()
-                
-                # Foydalanuvchiga tasdiq xabarini yuboramiz
-                confirm_msg = await client.send_message(
-                    chat_id, 
-                    f"✅ {user_mention}, faylingiz muvaffaqiyatli tekshirildi. Kiber-tahdid aniqlanmadi."
-                )
-                
-                # Asl faylni guruhga qaytarib yuboramiz (Copy orqali)
-                await message.copy(chat_id)
-                
-                # Tasdiq xabarini 10 soniyadan keyin o'chiramiz
-                asyncio.create_task(delete_after_delay(confirm_msg, 10))
-            except Exception as e:
-                logging.error(f"Faylni qaytarishda xato: {e}")
+                await temp_msg.delete()
+                await message.copy(chat_id) # Faylni qaytarish
+            except: pass
 
-    # --- 3. KANALGA LOG QILISH ---
-    # Tarixiy ma'lumotlar bilan birga kanalga hisobot yuborish
+    # --- 3. LOG KANALGA YUBORISH ---
     await log_to_private_channel(client, message, threat, chat_id, chat_title, user_info, user_id)
-    
+
 async def log_to_private_channel(client, message, threat, chat_id, chat_title, user_info, user_id):
-    """Kanalga tarixiy ma'lumotlar bilan hisobot yuborish"""
+    """Kanalga kiber-tahlil hisobotini yuborish (Peer ID muammosi yechilgan)"""
     if not DATABASE_CHANNEL: return
     
     try:
-        # Foydalanuvchi tarixini olish
-        incident_count = db.get_user_history(user_id)
+        # Peer ID xatosini oldini olish uchun integerga o'tkazamiz
+        target_chat = int(DATABASE_CHANNEL)
         
-        status = "🚨 **TAHDID ANIQLANDI VA BLOKLANDI**" if threat else "✅ **XAVFSIZ (TEKSHIRUVDAN O'TDI)**"
+        rank = "Foydalanuvchi"
+        try:
+            member = await client.get_chat_member(chat_id, user_id)
+            if member.status.name == "OWNER": rank = "👑 Owner"
+            elif member.status.name == "ADMINISTRATOR": rank = "👮 Admin"
+        except: pass
+
+        incident_count = db.get_user_history(user_id)
+        status = "🚨 **BLOKLANDI**" if threat else "✅ **TOZA**"
         color = "🔴" if threat else "🟢"
         
         log_report = (
@@ -528,29 +519,84 @@ async def log_to_private_channel(client, message, threat, chat_id, chat_title, u
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"🏢 **Guruh:** `{chat_title}`\n"
             f"👤 **Foydalanuvchi:** {user_info}\n"
-            f"🆔 **User ID:** `{user_id}`\n"
-            f"⚠️ **Xavf turi:** `{threat if threat else 'Toza / Xavfsiz'}`\n"
-            f"📊 **Qilmishlar tarixi:** `{incident_count}-marta`\n"
-            f"🕒 **Vaqt:** `{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}`\n"
+            f"🎖 **Mavqeyi:** `{rank}`\n"
+            f"⚠️ **Xavf:** `{threat if threat else 'Hech qanday'}`\n"
+            f"📊 **Incidentlar:** `{incident_count}-marta`\n"
+            f"🕒 **Vaqt:** `{datetime.now().strftime('%H:%M:%S')}`\n"
             f"━━━━━━━━━━━━━━━━━━━━"
         )
 
-        # Fayl yoki rasm bo'lsa kopyasini yuboramiz
         if message.photo or message.document or message.video:
-            await message.copy(DATABASE_CHANNEL, caption=log_report)
+            # Caption limitiga e'tibor beramiz
+            await message.copy(target_chat, caption=log_report[:1024])
         else:
-            msg_text = message.text or message.caption or "[Matn mavjud emas]"
-            full_log = f"{log_report}\n\n📝 **Asl xabar matni:**\n`{msg_text}`"
-            await client.send_message(DATABASE_CHANNEL, full_log)
+            msg_text = message.text or message.caption or "[Matn yo'q]"
+            await client.send_message(target_chat, f"{log_report}\n\n📝 **Kontent:**\n`{msg_text}`")
             
     except Exception as e:
-        logging.error(f"❌ Kanalga log yuborishda xato: {e}")
+        logging.error(f"❌ Kanalga loglashda xato: {e}")
+
+async def advanced_scan(message: Message):
+    """Skanerlashda fayl yo'llarini to'g'ri boshqarish"""
+    file_id = message.document.file_unique_id if message.document else (message.photo.file_unique_id if message.photo else "none")
+
+    # 1. Matn/Caption tahlili
+    content = f"{message.text or ''} {message.caption or ''}".strip()
+    if content:
+        clean_text = content.replace(" ", "").replace("-", "")
+        for label, pattern in PATTERNS.items():
+            if re.search(pattern, content, re.IGNORECASE) or re.search(pattern, clean_text):
+                return label
+        if await check_malicious_ai(content):
+            return "⚠️ Shubhali mazmun (AI)"
+
+    # 2. Rasm tahlili
+    if message.photo:
+        img_path = await message.download(file_name=f"downloads/{file_id}.jpg")
+        threat = None
+        
+        if OCR_AVAILABLE:
+            try:
+                results = await asyncio.to_thread(reader.readtext, img_path)
+                detected_text = " ".join([res[1] for res in results]).upper().replace(" ", "")
+                for label, pattern in PATTERNS.items():
+                    if re.search(pattern, detected_text):
+                        threat = f"{label} (OCR)"
+                        break
+            except Exception as e:
+                logging.error(f"OCR Error: {e}")
+
+        if not threat:
+            threat_ai = await check_image_ai(img_path)
+            if threat_ai: threat = f"{threat_ai} (AI Vision)"
+
+        if os.path.exists(img_path): os.remove(img_path)
+        return threat
+
+    # 3. Hujjat tahlili
+    if message.document:
+        if message.document.file_size <= 50 * 1024 * 1024:
+            file_name = message.document.file_name or "temp_file"
+            path = await message.download(file_name=f"downloads/{file_id}_{file_name}")
+            
+            try:
+                is_virus = await vt_scan_file(path) 
+                if is_virus: return "🦠 Virus/Zararli dastur"
+                
+                file_text = extract_text_from_file(path)
+                if file_text:
+                    clean_file_text = file_text.replace(" ", "").replace("-", "")
+                    for label, pattern in PATTERNS.items():
+                        if re.search(pattern, clean_file_text, re.IGNORECASE):
+                            return f"{label} (Hujjat ichida)"
+            finally:
+                if os.path.exists(path): os.remove(path)
+                        
+    return None
 
 async def delete_after_delay(msg: Message, delay: int):
-    """Xabarlarni ma'lum vaqtdan keyin o'chirish"""
     await asyncio.sleep(delay)
-    try:
-        await msg.delete()
+    try: await msg.delete()
     except: pass
 
 # --- 7. CALLBACK HANDLER (To'liq va To'g'rilangan Versiya) ---
